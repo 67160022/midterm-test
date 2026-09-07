@@ -1,153 +1,178 @@
 const { pool } = require("../db");
-const { redisClient } = require("../cache");
-const { authMiddleware, requireRole } = require("../middlewares/auth");
-
-const ALLOWED_SORT_FIELDS = ["course_name", "credit", "created_at"];
 
 module.exports = function registerCourseRoutes(v1Router, v2Router) {
-  // =========================
-  // GET courses
-  // Auth + Cache + Pagination
-  // =========================
-  v1Router.get("/courses", authMiddleware, async (req, res, next) => {
+  // ==========================================
+  // V1 Courses API
+  // ==========================================
+
+  // 1. GET: ดึงรายการรายวิชาทั้งหมด
+  v1Router.get("/courses", async (req, res, next) => {
     try {
-      const page = Number(req.query.page) || 1;
-      const limit = Number(req.query.limit) || 10;
-      const offset = (page - 1) * limit;
+      const [rows] = await pool.query("SELECT \* FROM courses");
 
-      const courseName = req.query.course_name || "";
-
-      let sortBy = req.query.sortBy || "created_at";
-
-      if (!ALLOWED_SORT_FIELDS.includes(sortBy)) {
-        sortBy = "created_at";
-      }
-
-      let order = req.query.order || "ASC";
-
-      if (order !== "ASC" && order !== "DESC") {
-        order = "ASC";
-      }
-
-      // Cache key
-      const cacheKey = `courses:${page}:${limit}:${courseName}:${sortBy}:${order}`;
-
-      // เช็ค Redis ก่อน
-      const cached = await redisClient.get(cacheKey);
-
-      if (cached) {
-        return res.json(JSON.parse(cached));
-      }
-
-      // Filter
-      let sql = "SELECT * FROM courses";
-      const params = [];
-
-      if (courseName) {
-        sql += " WHERE course_name LIKE ?";
-        params.push(`%${courseName}%`);
-      }
-
-      // Sort + Pagination
-      sql += ` ORDER BY ${sortBy} ${order} LIMIT ? OFFSET ?`;
-
-      params.push(limit);
-      params.push(offset);
-
-      const [rows] = await pool.query(sql, params);
-
-      const response = {
+      res.status(200).json({
         message: "สำเร็จ",
         data: rows,
-        pagination: {
-          page,
-          limit,
-        },
-      };
-
-      // เก็บลง Redis
-      await redisClient.set(cacheKey, JSON.stringify(response), { EX: 60 });
-
-      res.json(response);
+      });
     } catch (err) {
       next(err);
     }
   });
 
-  // =========================
-  // POST courses
-  // Auth + Admin + Transaction
-  // =========================
-  v1Router.post(
-    "/courses",
-    authMiddleware,
-    requireRole("admin"),
-    async (req, res, next) => {
-      const { course_name, credit, prerequisites = [] } = req.body;
+  // 2. GET: ดึงข้อมูลรายวิชาตาม id
+  v1Router.get("/courses/:id", async (req, res, next) => {
+    try {
+      const [rows] = await pool.query("SELECT \* FROM courses WHERE id = ?", [
+        req.params.id,
+      ]);
 
-      const connection = await pool.getConnection();
-
-      try {
-        // เริ่ม Transaction
-        await connection.beginTransaction();
-
-        // เพิ่ม course
-        const [result] = await connection.query(
-          `INSERT INTO courses (course_name, credit)
-           VALUES (?, ?)`,
-          [course_name, credit],
-        );
-
-        const courseId = result.insertId;
-
-        // เพิ่ม prerequisite
-        for (const prereqId of prerequisites) {
-          await connection.query(
-            `INSERT INTO course_prerequisites
-             (course_id, prereq_course_id)
-             VALUES (?, ?)`,
-            [courseId, prereqId],
-          );
-        }
-
-        // บันทึกทั้งหมด
-        await connection.commit();
-
-        // ล้าง cache
-        for await (const key of redisClient.scanIterator({
-          MATCH: "courses:*",
-        })) {
-          await redisClient.del(key);
-        }
-
-        res.status(201).json({
-          message: "เพิ่มข้อมูลสำเร็จ",
-          data: {
-            id: courseId,
+      // ไม่พบข้อมูล
+      if (rows.length === 0) {
+        return res.status(404).json({
+          error: {
+            code: "NOT_FOUND",
+            message: "ไม่พบข้อมูลรายวิชา",
           },
         });
-      } catch (err) {
-        // ถ้า error ยกเลิกทั้งหมด
-        await connection.rollback();
-
-        next(err);
-      } finally {
-        // คืน connection
-        connection.release();
       }
-    },
-  );
 
-  // =========================
-  // V2 API
-  // =========================
-  v2Router.get("/courses", authMiddleware, async (req, res, next) => {
+      res.status(200).json({
+        message: "สำเร็จ",
+        data: rows[0],
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // 3. POST: เพิ่มรายวิชาใหม่
+  v1Router.post("/courses", async (req, res, next) => {
+    const { course_name, credit } = req.body;
+
+    // ตรวจสอบข้อมูลที่จำเป็น
+    if (!course_name || !credit) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "กรุณาระบุ course_name และ credit ให้ครบถ้วน",
+        },
+      });
+    }
+
     try {
-      const [rows] = await pool.query("SELECT * FROM courses ORDER BY id");
+      const [result] = await pool.query(
+        "INSERT INTO courses (course_name, credit) VALUES (?, ?)",
+        [course_name, credit],
+      );
 
-      res.json({
-        version: "v2",
-        courses: rows,
+      res.status(201).json({
+        message: "เพิ่มข้อมูลสำเร็จ",
+        data: {
+          id: result.insertId,
+          course_name,
+          credit,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // 4. PUT: แก้ไขข้อมูลรายวิชาทั้งหมด
+  v1Router.put("/courses/:id", async (req, res, next) => {
+    const { course_name, credit } = req.body;
+
+    // ตรวจสอบข้อมูล
+    if (!course_name || !credit) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "กรุณาระบุ course_name และ credit ให้ครบถ้วน",
+        },
+      });
+    }
+
+    try {
+      const [result] = await pool.query(
+        `
+          UPDATE courses
+          SET course_name = ?, credit = ?
+          WHERE id = ?
+        `,
+        [course_name, credit, req.params.id],
+      );
+
+      // ไม่พบ id
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          error: {
+            code: "NOT_FOUND",
+            message: "ไม่พบข้อมูลรายวิชา",
+          },
+        });
+      }
+
+      res.status(200).json({
+        message: "แก้ไขข้อมูลสำเร็จ",
+        data: {
+          id: Number(req.params.id),
+          course_name,
+          credit,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // 5. DELETE: ลบรายวิชา
+  v1Router.delete("/courses/:id", async (req, res, next) => {
+    try {
+      const [result] = await pool.query("DELETE FROM courses WHERE id = ?", [
+        req.params.id,
+      ]);
+
+      // ไม่พบ id
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          error: {
+            code: "NOT_FOUND",
+            message: "ไม่พบข้อมูลรายวิชา",
+          },
+        });
+      }
+
+      res.status(200).json({
+        message: "ลบข้อมูลสำเร็จ",
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ==========================================
+  // V2 Courses API
+  // ==========================================
+
+  // 6. GET: ดึงรายวิชาแบบ Filter
+  v2Router.get("/courses", async (req, res, next) => {
+    const { minCredit } = req.query;
+
+    try {
+      let sql = "SELECT * FROM courses";
+      const values = [];
+
+      // ถ้ามี minCredit ให้กรองข้อมูล
+      if (minCredit !== undefined) {
+        sql += " WHERE credit >= ?";
+        values.push(minCredit);
+      }
+
+      const [rows] = await pool.query(sql, values);
+
+      res.status(200).json({
+        message: "สำเร็จ",
+        data: rows,
       });
     } catch (err) {
       next(err);

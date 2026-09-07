@@ -10,7 +10,7 @@
     "tokens": "node scripts/make-tokens.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.22.2",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.11.0",
     "redis": "^4.7.0"
